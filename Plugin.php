@@ -11,6 +11,8 @@ if (!defined('__TYPECHO_ROOT_DIR__')) exit;
  */
 class IPAuth_Plugin implements Typecho_Plugin_Interface
 {
+    private static $ipCache = null;
+    
     /**
      * Activate plugin method
      */
@@ -61,13 +63,12 @@ class IPAuth_Plugin implements Typecho_Plugin_Interface
         );
         $form->addInput($controlMode);
 
-        // Logo URL configuration
         $logoUrl = new Typecho_Widget_Helper_Form_Element_Text(
             'logoUrl',
             NULL,
             '',
             _t('提示框Logo URL'),
-            _t('隐藏内容提示框的Logo图片URL，留空使用默认图标')
+            _t('隐藏内容提示框的Logo图片URL，留空使用默认图标。请确保URL来源可信，避免使用不安全的外部链接。')
         );
         $form->addInput($logoUrl);
 
@@ -101,13 +102,12 @@ class IPAuth_Plugin implements Typecho_Plugin_Interface
         );
         $form->addInput($themeColor);
 
-        // Detect external IP
         $detectExternalIP = new Typecho_Widget_Helper_Form_Element_Radio(
             'detectExternalIP',
             array('1' => _t('启用'), '0' => _t('禁用')),
-            '1',
+            '0',
             _t('外网IP检测'),
-            _t('启用后会同时检测外网IP地址')
+            _t('启用后会同时检测外网IP地址。警告：此功能可能存在安全风险，建议仅在必要时启用。')
         );
         $form->addInput($detectExternalIP);
 
@@ -130,138 +130,161 @@ class IPAuth_Plugin implements Typecho_Plugin_Interface
     public static function personalConfig(Typecho_Widget_Helper_Form $form) {}
 
     /**
-     * Get user's real IP address
+     * Validate and sanitize URL input
+     * 
+     * @param string $url
+     * @return string
+     */
+    private static function sanitizeUrl($url)
+    {
+        if (empty($url)) {
+            return '';
+        }
+        
+        // Basic URL sanitization
+        $url = filter_var(trim($url), FILTER_SANITIZE_URL);
+        
+        // Validate URL format
+        if (!filter_var($url, FILTER_VALIDATE_URL)) {
+            return '';
+        }
+        
+        // Only allow HTTP and HTTPS protocols
+        $parsed = parse_url($url);
+        if (!isset($parsed['scheme']) || !in_array($parsed['scheme'], ['http', 'https'])) {
+            return '';
+        }
+        
+        return $url;
+    }
+    
+    /**
+     * Validate and sanitize color value
+     * 
+     * @param string $color
+     * @param string $default
+     * @return string
+     */
+    private static function sanitizeColor($color, $default = '#000000')
+    {
+        if (empty($color)) {
+            return $default;
+        }
+        
+        // Validate hexadecimal color format
+        if (preg_match('/^#[0-9A-Fa-f]{6}$/', $color)) {
+            return $color;
+        }
+        
+        return $default;
+    }
+
+    /**
+     * Get user's real IP address (Security Enhanced Version)
      * 
      * @return array Returns local IP and external IP
      */
     private static function getRealIP()
     {
+        if (self::$ipCache !== null) {
+            return self::$ipCache;
+        }
+        
         $localIP = '';
         $externalIP = '';
         
-        // Get local IP
-        if (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
-            $ips = explode(',', $_SERVER['HTTP_X_FORWARDED_FOR']);
-            $localIP = trim($ips[0]);
-        } elseif (!empty($_SERVER['HTTP_X_REAL_IP'])) {
-            $localIP = $_SERVER['HTTP_X_REAL_IP'];
-        } elseif (!empty($_SERVER['HTTP_CLIENT_IP'])) {
-            $localIP = $_SERVER['HTTP_CLIENT_IP'];
-        } else {
-            $localIP = $_SERVER['REMOTE_ADDR'];
+        // Priority order: Trusted proxy headers > Standard headers > REMOTE_ADDR
+        $trustHeaders = array(
+            'HTTP_CF_CONNECTING_IP',     // Cloudflare (most trusted)
+            'HTTP_X_REAL_IP',           // Nginx proxy
+            'HTTP_TRUE_CLIENT_IP',      // Akamai/Cloudflare
+            'HTTP_X_FORWARDED_FOR'      // Standard proxy header (least trusted)
+        );
+        
+        foreach ($trustHeaders as $header) {
+            if (!empty($_SERVER[$header])) {
+                $headerValue = $_SERVER[$header];
+                
+                // Handle X-Forwarded-For which may contain multiple IPs
+                if ($header === 'HTTP_X_FORWARDED_FOR') {
+                    $ips = array_map('trim', explode(',', $headerValue));
+                    $headerValue = $ips[0]; // Take the first IP
+                }
+                
+                // Validate IP format and exclude private IPs
+                if (filter_var($headerValue, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
+                    $localIP = $headerValue;
+                    break;
+                }
+            }
         }
         
-        // Try to get external IP (if enabled)
+        // If no valid public IP found, use REMOTE_ADDR
+        if (empty($localIP)) {
+            $localIP = isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : '';
+        }
+        
+        // External IP detection (if enabled)
         $options = Typecho_Widget::widget('Widget_Options');
         $pluginOptions = $options->plugin('IPAuth');
         
         if ($pluginOptions && isset($pluginOptions->detectExternalIP) && $pluginOptions->detectExternalIP == '1') {
-            // Method 1: Get from HTTP header (safest, no external requests)
-            if (!empty($_SERVER['HTTP_CF_CONNECTING_IP'])) {
-                // Cloudflare
-                $externalIP = $_SERVER['HTTP_CF_CONNECTING_IP'];
-            } elseif (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
-                // Get the last IP in the X-Forwarded-For chain (usually the original client IP)
-                $ips = explode(',', $_SERVER['HTTP_X_FORWARDED_FOR']);
-                $externalIP = trim(end($ips));
-            } elseif (!empty($_SERVER['HTTP_TRUE_CLIENT_IP'])) {
-                // Akamai and Cloudflare
-                $externalIP = $_SERVER['HTTP_TRUE_CLIENT_IP'];
-            } elseif (!empty($_SERVER['HTTP_X_CLUSTER_CLIENT_IP'])) {
-                // Rackspace Cloud Load Balancer
-                $externalIP = $_SERVER['HTTP_X_CLUSTER_CLIENT_IP'];
-            }
-            
-            // Method 2: Use multiple trusted services to verify (optional, reduces hijacking risk)
-            if (empty($externalIP) || $externalIP === $localIP) {
-                $externalIP = self::getExternalIPFromMultipleSources();
-            }
-            
-            // Validate the gotten IP whether it's a valid public IP
-            if (!empty($externalIP)) {
-                // Filter private IP addresses
-                if (self::isPrivateIP($externalIP)) {
-                    $externalIP = '';
-                }
-            }
-            
-            // If the external IP and local IP are the same, consider no valid external IP has been obtained
-            if ($externalIP === $localIP) {
-                $externalIP = '';
-            }
+            $externalIP = self::getExternalIPSafely();
         }
         
-        return array('local' => $localIP, 'external' => $externalIP);
+        $result = array('local' => $localIP, 'external' => $externalIP);
+        self::$ipCache = $result;
+        
+        return $result;
     }
     
     /**
-     * Get external IP from multiple trusted sources (increases security)
+     * Safe external IP detection method
      * 
      * @return string
      */
-    private static function getExternalIPFromMultipleSources()
+    private static function getExternalIPSafely()
     {
-        // Use multiple trusted IP detection services
         $services = array(
-            'https://ipv4.icanhazip.com',      // High credibility
-            'https://api.ipify.org',            // High credibility
-            'https://ipecho.net/plain',         // Backup
-            'https://checkip.amazonaws.com',    // AWS official service
+            'https://checkip.amazonaws.com',    // AWS official service (most trusted)
+            'https://api.ipify.org',            // Well-known service
         );
         
         $context = stream_context_create([
             'http' => [
-                'timeout' => 1,  // 1 second timeout
+                'timeout' => 2,  // Increased to 2 seconds timeout
                 'method' => 'GET',
-                'header' => 'User-Agent: Typecho IPAuth Plugin',
-                'follow_location' => 0,  // Do not follow redirects
+                'header' => [
+                    'User-Agent: Typecho IPAuth Plugin/1.1.0',
+                    'Accept: text/plain',
+                    'Connection: close'
+                ],
+                'follow_location' => 0,
+                'max_redirects' => 0,
             ],
             'ssl' => [
                 'verify_peer' => true,
                 'verify_peer_name' => true,
+                'allow_self_signed' => false,
             ]
         ]);
         
-        $results = array();
-        
-        // Try to get the IP from multiple services
         foreach ($services as $service) {
-            $response = @file_get_contents($service, false, $context);
-            if ($response !== false) {
-                $ip = trim($response);
-                // Validate if it's a valid IPv4 address
-                if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 | FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
-                    $results[] = $ip;
-                    // If two services return the same IP, consider it trusted
-                    if (count(array_keys($results, $ip)) >= 2) {
+            try {
+                $response = @file_get_contents($service, false, $context);
+                if ($response !== false) {
+                    $ip = trim($response);
+                    if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 | FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
                         return $ip;
                     }
                 }
+            } catch (Exception $e) {
+                // Silently handle errors, continue to next service
+                continue;
             }
         }
         
-        // If there is only one result, return it (but lower credibility)
-        if (!empty($results)) {
-            return $results[0];
-        }
-        
         return '';
-    }
-    
-    /**
-     * Check if the IP address is private
-     * 
-     * @param string $ip
-     * @return bool
-     */
-    private static function isPrivateIP($ip)
-    {
-        // Use PHP built-in filter to check if it's a private or reserved IP
-        return !filter_var(
-            $ip, 
-            FILTER_VALIDATE_IP, 
-            FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE
-        );
     }
 
     /**
@@ -274,6 +297,10 @@ class IPAuth_Plugin implements Typecho_Plugin_Interface
     private static function isAuthorizedIP($userIP, $authorizedIPs)
     {
         $userIP = trim($userIP);
+        
+        if (!filter_var($userIP, FILTER_VALIDATE_IP)) {
+            return false;
+        }
         
         foreach ($authorizedIPs as $authorizedIP) {
             $authorizedIP = trim($authorizedIP);
@@ -307,12 +334,31 @@ class IPAuth_Plugin implements Typecho_Plugin_Interface
      */
     private static function ipInRange($ip, $range)
     {
+        if (strpos($range, '/') === false) {
+            return false;
+        }
+        
         list($subnet, $bits) = explode('/', $range);
+        
+        // Validate CIDR format
+        if (!is_numeric($bits)) {
+            return false;
+        }
         
         if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
             // IPv4
+            $bits = intval($bits);
+            if ($bits < 0 || $bits > 32) {
+                return false;
+            }
+            
             $ip = ip2long($ip);
             $subnet = ip2long($subnet);
+            
+            if ($ip === false || $subnet === false) {
+                return false;
+            }
+            
             $mask = -1 << (32 - $bits);
             $subnet &= $mask;
             return ($ip & $mask) == $subnet;
@@ -365,30 +411,29 @@ class IPAuth_Plugin implements Typecho_Plugin_Interface
             // Show protected content, removing tags
             $content = preg_replace($pattern, '$1', $content);
         } else {
-            // Generate custom styled hidden content prompt
-            $logoUrl = isset($pluginOptions->logoUrl) ? $pluginOptions->logoUrl : '';
-            $customText = isset($pluginOptions->customText) ? $pluginOptions->customText : '此区域的内容仅允许通过南方医科大学校内 IP 进行访问，请首先登入校园网环境。';
-            $backgroundColor = isset($pluginOptions->backgroundColor) ? $pluginOptions->backgroundColor : '#f0f9ec';
-            $themeColor = isset($pluginOptions->themeColor) ? $pluginOptions->themeColor : '#78C841';
+            $logoUrl = self::sanitizeUrl(isset($pluginOptions->logoUrl) ? $pluginOptions->logoUrl : '');
+            $customText = isset($pluginOptions->customText) ? htmlspecialchars($pluginOptions->customText, ENT_QUOTES, 'UTF-8') : '此区域的内容仅允许通过南方医科大学校内 IP 进行访问，请首先登入校园网环境。';
+            $backgroundColor = self::sanitizeColor(isset($pluginOptions->backgroundColor) ? $pluginOptions->backgroundColor : '', '#f0f9ec');
+            $themeColor = self::sanitizeColor(isset($pluginOptions->themeColor) ? $pluginOptions->themeColor : '', '#78C841');
             
             // Default Logo SVG (circular lock icon)
             $defaultLogo = '<svg width="60" height="60" viewBox="0 0 60 60" xmlns="http://www.w3.org/2000/svg">
-                <circle cx="30" cy="30" r="28" fill="' . $themeColor . '" opacity="0.1"/>
-                <circle cx="30" cy="30" r="25" fill="none" stroke="' . $themeColor . '" stroke-width="2"/>
-                <path d="M30 15c-4.5 0-8 3.5-8 8v5h-2v12h20V28h-2v-5c0-4.5-3.5-8-8-8zm5 8v5H25v-5c0-2.8 2.2-5 5-5s5 2.2 5 5z" fill="' . $themeColor . '"/>
+                <circle cx="30" cy="30" r="28" fill="' . htmlspecialchars($themeColor, ENT_QUOTES, 'UTF-8') . '" opacity="0.1"/>
+                <circle cx="30" cy="30" r="25" fill="none" stroke="' . htmlspecialchars($themeColor, ENT_QUOTES, 'UTF-8') . '" stroke-width="2"/>
+                <path d="M30 15c-4.5 0-8 3.5-8 8v5h-2v12h20V28h-2v-5c0-4.5-3.5-8-8-8zm5 8v5H25v-5c0-2.8 2.2-5 5-5s5 2.2 5 5z" fill="' . htmlspecialchars($themeColor, ENT_QUOTES, 'UTF-8') . '"/>
             </svg>';
             
             $logoHTML = '';
             if (!empty($logoUrl)) {
-                $logoHTML = '<img src="' . $logoUrl . '" alt="Logo" style="width: 60px; height: 60px; margin-right: 20px;">';
+                $logoHTML = '<img src="' . htmlspecialchars($logoUrl, ENT_QUOTES, 'UTF-8') . '" alt="Logo" style="width: 60px; height: 60px; margin-right: 20px; object-fit: contain;">';
             } else {
                 $logoHTML = '<div style="margin-right: 20px;">' . $defaultLogo . '</div>';
             }
             
             $hiddenHTML = '
             <div style="
-                background: ' . $backgroundColor . ';
-                border: 2px solid ' . $themeColor . ';
+                background: ' . htmlspecialchars($backgroundColor, ENT_QUOTES, 'UTF-8') . ';
+                border: 2px solid ' . htmlspecialchars($themeColor, ENT_QUOTES, 'UTF-8') . ';
                 border-radius: 8px;
                 padding: 20px;
                 margin: 20px 0;
@@ -398,24 +443,24 @@ class IPAuth_Plugin implements Typecho_Plugin_Interface
             ">
                 ' . $logoHTML . '
                 <div style="
-                    color: ' . $themeColor . ';
+                    color: ' . htmlspecialchars($themeColor, ENT_QUOTES, 'UTF-8') . ';
                     font-size: 16px;
                     line-height: 1.5;
                     flex: 1;
-                ">' . htmlspecialchars($customText) . '</div>
+                ">' . $customText . '</div>
             </div>';
             
             $content = preg_replace($pattern, $hiddenHTML, $content);
         }
         
-        // Debug mode: show current IP (only for admin)
+        // Debug mode display (admin only)
         if (isset($pluginOptions->debugMode) && $pluginOptions->debugMode && self::isAdmin()) {
-            $debugInfo = '<div style="position: fixed; bottom: 10px; right: 10px; background: rgba(0,0,0,0.8); color: white; padding: 10px; border-radius: 5px; font-size: 12px; z-index: 9999;">';
-            $debugInfo .= '内网IP: ' . $userIP;
+            $debugInfo = '<div style="position: fixed; bottom: 10px; right: 10px; background: rgba(0,0,0,0.8); color: white; padding: 10px; border-radius: 5px; font-size: 12px; z-index: 9999; max-width: 300px;">';
+            $debugInfo .= '内网IP: ' . htmlspecialchars($userIP, ENT_QUOTES, 'UTF-8');
             if (!empty($externalIP)) {
-                $debugInfo .= ' | 外网IP: ' . $externalIP;
+                $debugInfo .= '<br>外网IP: ' . htmlspecialchars($externalIP, ENT_QUOTES, 'UTF-8');
             }
-            $debugInfo .= ' | 模式: ' . $controlMode . ' | 状态: ' . ($shouldShowContent ? '可见' : '隐藏') . '</div>';
+            $debugInfo .= '<br>模式: ' . htmlspecialchars($controlMode, ENT_QUOTES, 'UTF-8') . ' | 状态: ' . ($shouldShowContent ? '可见' : '隐藏') . '</div>';
             $content .= $debugInfo;
         }
         
@@ -429,7 +474,11 @@ class IPAuth_Plugin implements Typecho_Plugin_Interface
      */
     private static function isAdmin()
     {
-        $user = Typecho_Widget::widget('Widget_User');
-        return $user->hasLogin() && $user->pass('administrator', true);
+        try {
+            $user = Typecho_Widget::widget('Widget_User');
+            return $user->hasLogin() && $user->pass('administrator', true);
+        } catch (Exception $e) {
+            return false;
+        }
     }
 }
